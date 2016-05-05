@@ -254,6 +254,7 @@ class Summoner(JSONObject):
 		# Non-json private vars
 		self._masteries = None
 		self._matches = None
+		self._classifications = None
 
 	@property
 	def masteries(self):
@@ -269,18 +270,39 @@ class Summoner(JSONObject):
 			self._matches = get_match_list(self.s_id) 
 		return self._matches
 
-	def classify(self):
+	@property
+	def classifications(self):
 		"""
-		Gets a classification for the current player.
+		Gets the classifications for the current player.
+		"""
+		if self._classifications is None:
+			# We're going to average the skill in each category
+			# of champion i.e. fighter, support, etc.
 
-		So I could either incorporate my own ranking system,
-		or go on the rank of the player in the game, or I 
-		could incorporate the players rank into my own system.
-		I think because we're assessing a players ability based
-		on the mastery system then we're going to have to re-rank
-		and combine.
-		"""
-		pass
+			# Make it easier to get everything together.
+			# Don't worry we make it awful right after this.
+			bins = {}
+			for mastery in self.masteries:
+				for bin_type in mastery.champion.tags:
+					if bin_type not in bins:
+						bins[bin_type] = {"classification": bin_type, "champions": [], "score": 0, "overall_level": 0}
+
+					bins[bin_type]["champions"].append({"name": mastery.champion.name, "score": mastery.champion_points})
+					bins[bin_type]["score"] += mastery.champion_points
+					bins[bin_type]["overall_level"] += mastery.champion_level
+
+			# Going to rejam everything in here. I blame myself.
+			classifications = []
+			for b_type, data in bins.iteritems():
+				# Maintain order on each champion
+				data["champions"].sort(key=lambda c: c["score"], reverse=True)
+				classifications.append(data)
+
+			# We also want to maintain order on each type
+			classifications.sort(key=lambda c: c["score"], reverse=True)
+
+			self._classifications = classifications
+		return self._classifications
 
 class Mastery(JSONObject):
 	"""Mastery model object for working with data from the API. Treat this as readonly."""
@@ -401,7 +423,7 @@ Startup
 def main():
 	# Stop wasting so much space
 	app.config.update(
-		JSONIFY_PRETTYPRINT_REGULAR=False
+		JSONIFY_PRETTYPRINT_REGULAR=True
 	)
 
 	if args.public:
