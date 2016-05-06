@@ -188,6 +188,7 @@ class Match(JSONObject):
 
 		# Non-json private vars
 		self._match = None
+		self._champion = None
 
 	@property
 	def match_data(self):
@@ -195,6 +196,13 @@ class Match(JSONObject):
 		if self._match is None:
 			self._match = get_match(self.match_id)
 		return self._match
+
+	@property
+	def match_champion(self):
+		"""The champion that the player played in this match"""
+		if self._champion is None:
+			self._champion = specific_champion(self.champion)
+		return self._champion
 
 class MatchData(JSONObject):
 	"""MatchData model object for working with data from the API. Treat this as readonly."""
@@ -279,6 +287,24 @@ class Summoner(JSONObject):
 			# We're going to average the skill in each category
 			# of champion i.e. fighter, support, etc.
 
+			# We need to build a mapping of how players
+			# play their champions. This will help us make
+			# the final decision as to where they should be
+			# placed in their team.
+			champion_mapping = {}
+			champion_lane_mapping = map(lambda m: (m.match_champion.name, m.lane), self.matches)
+			for lane_mapping in champion_lane_mapping:
+				champ = lane_mapping[0]
+				lane = lane_mapping[1]
+
+				# Get the basic stuff in so we can build this
+				if champ not in champion_mapping:
+					champion_mapping[champ] = {}
+				if lane not in champion_mapping[champ]:
+					champion_mapping[champ][lane] = 0
+
+				champion_mapping[champ][lane] += 1
+
 			# Make it easier to get everything together.
 			# Don't worry we make it awful right after this.
 			bins = {}
@@ -287,7 +313,12 @@ class Summoner(JSONObject):
 					if bin_type not in bins:
 						bins[bin_type] = {"classification": bin_type, "champions": [], "score": 0, "overall_level": 0}
 
-					bins[bin_type]["champions"].append({"name": mastery.champion.name, "score": mastery.champion_points})
+					bins[bin_type]["champions"].append(
+						{
+							"name": mastery.champion.name, 
+							"score": mastery.champion_points, 
+							"lanes": [{"lane": lane, "count": count} for lane, count in champion_mapping[mastery.champion.name].iteritems()] if mastery.champion.name in champion_mapping else []
+						})
 					bins[bin_type]["score"] += mastery.champion_points
 					bins[bin_type]["overall_level"] += mastery.champion_level
 
@@ -296,6 +327,8 @@ class Summoner(JSONObject):
 			for b_type, data in bins.iteritems():
 				# Maintain order on each champion
 				data["champions"].sort(key=lambda c: c["score"], reverse=True)
+				for champion in data["champions"]:
+					champion["lanes"].sort(key=lambda l: l["count"], reverse=True)
 				classifications.append(data)
 
 			# We also want to maintain order on each type
@@ -365,6 +398,8 @@ def join_a_team(username):
 
 	cache_obj = cache.get(cache_key)
 
+	summoner = name_to_summoner(name)
+
 	if cache_obj is not None:
 		return make_error(error="No, just no.")
 	else:
@@ -374,7 +409,7 @@ def join_a_team(username):
 			team = store[0]
 			if name not in team:
 				team.append(name)
-			return make_success(response={"leader": team[0], "teamMembers": list(team)})
+			return make_success(response={"leader": team[0], "teamMembers": list(team), "class": summoner.classifications})
 		else:
 			return make_error(error="No teams available")
 
