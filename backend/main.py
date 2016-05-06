@@ -313,11 +313,17 @@ class Summoner(JSONObject):
 					if bin_type not in bins:
 						bins[bin_type] = {"classification": bin_type, "champions": [], "score": 0, "overall_level": 0}
 
+					lanes = None
+					if mastery.champion.name in champion_mapping:
+						lanes = [{"lane": lane, "count": count} for lane, count in champion_mapping[mastery.champion.name].iteritems()]
+					else: 
+						lanes = []
+
 					bins[bin_type]["champions"].append(
 						{
 							"name": mastery.champion.name, 
 							"score": mastery.champion_points, 
-							"lanes": [{"lane": lane, "count": count} for lane, count in champion_mapping[mastery.champion.name].iteritems()] if mastery.champion.name in champion_mapping else []
+							"lanes": lanes
 						})
 					bins[bin_type]["score"] += mastery.champion_points
 					bins[bin_type]["overall_level"] += mastery.champion_level
