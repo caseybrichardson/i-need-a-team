@@ -2,34 +2,73 @@ from flask import Flask
 from flask import request
 from flask import Response
 from flask import jsonify
+from flask import g
 from flask.ext.cors import CORS
-from werkzeug.contrib.cache import SimpleCache
+from werkzeug.contrib.cache import RedisCache
 from argparse import ArgumentParser
 from collections import Counter
 from collections import deque
+import sqlite3
 import json
-import pykka
 import urllib
 import requests
 import sys
 import datetime
 import time
-import hashlib
 
 app = Flask(__name__)
 CORS(app)
 
-parser = ArgumentParser(description="API for Riot API Challenge 2016 project")
-parser.add_argument("-d", "--debug", dest="debug", action="store_true", help="sets the debug flag when running Flask")
-parser.add_argument("-p", "--public", dest="public", action="store_true", help="allows the API to run publicly")
-parser.add_argument("-c", "--cache", dest="cache", action="store_true", help="causes the API to cache responses and use local resources")
-parser.add_argument("-t", "--thread", dest="thread", action="store_true", help="causes Flask to run in threaded mode")
-parser.add_argument("-k", "--api-key", dest="api_key", default="", help="the Riot API key")
-args = parser.parse_args()
+args = None
+cache = None
+if __name__ == '__main__':
+	parser = ArgumentParser(description="API for Riot API Challenge 2016 project")
+	parser.add_argument("-d", "--debug", dest="debug", action="store_true", help="sets the debug flag when running Flask")
+	parser.add_argument("-p", "--public", dest="public", action="store_true", help="allows the API to run publicly")
+	parser.add_argument("-c", "--cache", dest="cache", action="store_true", help="causes the API to cache responses and use local resources")
+	parser.add_argument("-t", "--thread", dest="thread", action="store_true", help="causes Flask to run in threaded mode")
+	parser.add_argument("-k", "--api-key", dest="api_key", default="", help="the Riot API key")
+	args = parser.parse_args()
 
-if args.api_key == "":
-	print("No API key provided. Exiting.")
-	sys.exit(1)
+	if args.api_key == "":
+		print("No API key provided. Exiting.")
+		sys.exit(1)
+
+	if args.cache:
+		cache = RedisCache(default_timeout=0)
+
+"""
+===============================
+Database Tools
+(These are ripped almost straight from the Flask docs on sqlite integration)
+===============================
+"""
+
+def get_db():
+  db = getattr(g, '_database', None)
+  if db is None:
+    db = g._database = sqlite3.connect(database_url)
+    db.row_factory = sqlite3.Row
+  return db
+
+def query_db(query, args=(), one=False):
+  cur = get_db().execute(query, args)
+  rv = cur.fetchall()
+  cur.close()
+  return (rv[0] if rv else None) if one else rv
+
+def init_db():
+  with app.app_context():
+    db = get_db()
+    with app.open_resource('schema.sql', mode='r') as f:
+      db.cursor().executescript(f.read())
+    db.commit()
+
+@app.teardown_appcontext
+def close_connection(exception):
+  db = getattr(g, '_database', None)
+  if db is not None:
+    db.close()
 
 """
 ===============================
@@ -37,13 +76,11 @@ Defaults and Utils
 ===============================
 """
 
-api_key = args.api_key
+if args is not None:
+	api_key = args.api_key
 base_url = "https://na.api.pvp.net"
 static_base_url = "https://global.api.pvp.net"
-
-# We're gonna cheat and use this until we use a real data store
-store = deque()
-cache = SimpleCache()
+database_url = './database.db'
 
 # So the regions for the static endpoints barf on upper-case regions
 def champ_all(region="na"):
@@ -119,7 +156,7 @@ def all_champions():
 		champs_data = requests.get(champs_data_url).json()["data"]
 		return map(lambda c: Champion(c), champs_data.values())
 	else:
-		return cache_data["champion"].values()
+		return cache.get("champion").values()
 
 def specific_champion(champion_id):
 	if not args.cache:
@@ -127,7 +164,7 @@ def specific_champion(champion_id):
 		champ_data = requests.get(champ_data_url).json()
 		return Champion(champ_data)
 	else:
-		return cache_data["champion"][champion_id]
+		return cache.get("champion")[champion_id]
 
 def name_to_summoner(name):
 	normalized = normalize_name(name)
@@ -208,6 +245,26 @@ class MatchData(JSONObject):
 	"""MatchData model object for working with data from the API. Treat this as readonly."""
 	def __init__(self, json_obj):
 		super(MatchData, self).__init__(json_obj)
+		participants = json_obj["participants"]
+		participant_ids = json_obj["participantIdentities"]
+		self.participants = {}
+		for participant_id in participant_ids:
+			participant = filter(lambda p: p["participantId"] == participant_id["participantId"], participants)
+			if participant is not None:
+				participant = MatchParticipant(participant[0])
+				summoner_id = participant_id["player"]["summonerId"]
+				self.participants[summoner_id] = participant
+
+class MatchParticipant(JSONObject):
+	"""MatchParticipant model object for working with data from the API. Treat this as readonly."""
+	def __init__(self, json_obj):
+		super(MatchParticipant, self).__init__(json_obj)
+		self.spell_one_id = json_obj["spell1Id"]
+		self.spell_two_id = json_obj["spell2Id"]
+		self.participant_id = json_obj["participantId"]
+		self.champion_id = json_obj["championId"]
+		self.team_id = json_obj["teamId"]
+		self.highest_achieved_season_tier = json_obj["highestAchievedSeasonTier"]
 
 class Champion(JSONObject):
 	"""Champion model object for working with data from the API. Treat this as readonly."""
@@ -260,9 +317,16 @@ class Summoner(JSONObject):
 		self.json["profileIconUrl"] = self.profile_icon_url
 
 		# Non-json private vars
+		self._highest_rank = None
 		self._masteries = None
 		self._matches = None
 		self._classifications = None
+
+	@property
+	def highest_rank(self):
+		"""Summoners highest rank"""
+		for match in self.matches:
+			return match.match_data.participants[self.s_id].highest_achieved_season_tier
 
 	@property
 	def masteries(self):
@@ -366,10 +430,6 @@ class Mastery(JSONObject):
 			self._champion = specific_champion(self.champion_id)
 		return self._champion
 
-class Team():
-	def __init__(self):
-		pass
-
 """
 ===============================
 Response Tools
@@ -398,62 +458,76 @@ def join_a_team(username):
 	# Not a fan of this
 	global store
 	global cache
+	db = get_db()
+	cur = db.cursor()
 
 	name = normalize_name(username)
-	cache_key = "jat-" + name
-
-	cache_obj = cache.get(cache_key)
-
 	summoner = name_to_summoner(name)
 
-	if cache_obj is not None:
-		return make_error(error="No, just no.")
+	player = query_db('SELECT * FROM player WHERE summoner_name = ?', [name], one=True)
+
+	if player is None:
+		cur.execute('''INSERT INTO player (id, summoner_name, highest_rank) VALUES (NULL, ?, ?)''', (name, summoner.highest_rank))
+		player_id = cur.lastrowid
+		db.commit()
 	else:
-		# Oh well, just shove them into the only team
-		team = None
-		if len(store) == 1:
-			team = store[0]
-			if name not in team:
-				team.append(name)
-			return make_success(response={"leader": team[0], "teamMembers": list(team), "class": summoner.classifications})
-		else:
-			return make_error(error="No teams available")
+		pass
+
+	return make_success(response="You're on the list!")
 
 @app.route("/api/makeateam/<username>", methods=["POST", "GET"])
 def make_a_team(username):
 	# Not a fan of this
 	global store
 	global cache
+	db = get_db()
+	cur = db.cursor()
 
 	name = normalize_name(username)
-	cache_key = "mat-" + name
+	summoner = name_to_summoner(name)
 
-	cache_obj = cache.get(cache_key)
+	# Check if this player is on a team already
+	player = query_db('SELECT * FROM player WHERE summoner_name = ?', [name], one=True)
 
-	if cache_obj is not None:
-		team = store[cache_obj]
-		return make_success(response={"leader": team[0], "teamMembers": list(team)})
+	if player is None:
+		# They were not so create a player and then add them to a team as the leader
+		cur.execute('''INSERT INTO player (id, summoner_name, highest_rank) VALUES (NULL, ?, ?)''', (name, summoner.highest_rank))
+		player_id = cur.lastrowid
+		cur.execute('''INSERT INTO team (id, create_time) VALUES (NULL, ?)''', (int(time.time()),))
+		team_id = cur.lastrowid
+		cur.execute('''INSERT INTO players_teams VALUES (?, ?, 1)''', (player_id, team_id))
+		db.commit()
+		return make_success(response={"leader": name})
 	else:
-		if args.cache:
-			cache.set(name, len(store))
-		team = deque()
-		team.append(name)
-		store.append(team)
-		json_serializable = list(team)
-		return make_success(response={"leader": name, "teamMembers": list(team)})
-	
+		teams = query_db('SELECT * FROM players_teams WHERE player_id = ? AND leader = 1', [player["id"]])
+
+		# Scan through all the teams they've ever lead and see if any are still active
+		for team in teams:
+			team_active = query_db('SELECT count(*) FROM players_teams WHERE team_id = ?', [team[1]], one=True)
+			if team_active is not None:
+				if team_active != 5:
+					return make_error(error={"message": "Sorry! You're already in an active search for a team!"}, response_code=200)
+
+		# If they're not actively leading a team, create a new one and put them as the leader
+		cur.execute('''INSERT OR IGNORE INTO player (id, summoner_name, highest_rank) VALUES (NULL, ?, ?)''', (name, summoner.highest_rank))
+		player_id = cur.lastrowid
+		cur.execute('''INSERT INTO team (id, create_time) VALUES (NULL, ?)''', (int(time.time()),))
+		team_id = cur.lastrowid
+		cur.execute('''INSERT INTO players_teams VALUES (?, ?, 1)''', (player_id, team_id))
+		db.commit()
+		return make_success(response={"leader": name})
+
 """
 ===============================
-Caching
+Cache
 ===============================
 """
 
-cache_data = {}
-if args.cache:
+if args and args.cache:
 	# Warms up our caches.
 	# Load the champion cache file.
 	champs = json.loads(open("cache/champions.json").read())["data"]
-	cache_data["champion"] = {champ["id"]: Champion(champ) for champ in champs.values()}
+	cache.set("champion", {champ["id"]: Champion(champ) for champ in champs.values()})
 
 """
 ===============================
@@ -464,7 +538,7 @@ Startup
 def main():
 	# Stop wasting so much space
 	app.config.update(
-		JSONIFY_PRETTYPRINT_REGULAR=True
+		JSONIFY_PRETTYPRINT_REGULAR=False
 	)
 
 	if args.public:
