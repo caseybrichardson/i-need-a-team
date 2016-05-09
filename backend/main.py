@@ -178,7 +178,7 @@ def specific_champion(champion_id):
 		champ_data = get_request(champ_data_url).json()
 		return Champion(champ_data)
 	else:
-		return cache.get("champion")[champion_id]
+		return cache.get("champ-" + str(champion_id))
 
 def name_to_summoner(name):
 	normalized = normalize_name(name)
@@ -347,7 +347,10 @@ class Match(JSONObject):
 	def match_champion(self):
 		"""The champion that the player played in this match"""
 		if self._champion is None:
+			start = epoch_time()
+			print("GETTING MATCH CHAMPION: " + str(start))
 			self._champion = specific_champion(self.champion)
+			print("DONE GETTING MATCH CHAMPION: " + str(epoch_time() - start))
 		return self._champion
 
 class MatchData(JSONObject):
@@ -442,6 +445,8 @@ class Summoner(JSONObject):
 		"""Masteries for the current summoner"""
 		if self._masteries is None:
 			self._masteries = get_masteries(self.s_id)
+		if get_arg("cache"):
+			cache.set("summ-" + normalize_name(self.name), self)
 		return self._masteries
 
 	@property
@@ -449,6 +454,8 @@ class Summoner(JSONObject):
 		"""Matches for the current summoner"""
 		if self._matches is None:
 			self._matches = get_match_list(self.s_id) 
+		if get_arg("cache"):
+			cache.set("summ-" + normalize_name(self.name), self)
 		return self._matches
 
 	@property
@@ -464,8 +471,6 @@ class Summoner(JSONObject):
 			# play their champions. This will help us make
 			# the final decision as to where they should be
 			# placed in their team.
-			start = epoch_time()
-			print("Starting champ mapping at: " + str(start))
 			champion_mapping = {}
 			champion_lane_mapping = map(lambda m: (m.match_champion.name, m.lane), self.matches)
 			for lane_mapping in champion_lane_mapping:
@@ -479,12 +484,10 @@ class Summoner(JSONObject):
 					champion_mapping[champ][lane] = 0
 
 				champion_mapping[champ][lane] += 1
-			print("Done champ mapping in: " + str(epoch_time() - start))
 
 			# Make it easier to get everything together.
 			# Don't worry we make it awful right after this.
 			start = epoch_time()
-			print("Building bins at: " + str(start))
 			bins = {}
 			for mastery in self.masteries:
 				for bin_type in mastery.champion.tags:
@@ -505,11 +508,9 @@ class Summoner(JSONObject):
 						})
 					bins[bin_type]["score"] += mastery.champion_points
 					bins[bin_type]["overall_level"] += mastery.champion_level
-			print("Done building bins in: " + str(epoch_time() - start))
 
 			# Going to rejam everything in here. I blame myself.
 			start = epoch_time()
-			print("Sorting all the crap at: " + str(start))
 			classifications = []
 			for b_type, data in bins.iteritems():
 				# Maintain order on each champion
@@ -520,9 +521,13 @@ class Summoner(JSONObject):
 
 			# We also want to maintain order on each type
 			classifications.sort(key=lambda c: c["score"], reverse=True)
-			print("Done sorting all that crap at: " + str(epoch_time() - start))
 
 			self._classifications = classifications
+
+		# Re-cache at this point. We've done a very expensive bit of work.
+		# Though as stated earlier I blame myself.
+		if get_arg("cache"):
+			cache.set("summ-" + normalize_name(self.name), self)
 		return self._classifications
 
 class Mastery(JSONObject):
@@ -621,7 +626,8 @@ if args and args.cache:
 	# Warms up our caches.
 	# Load the champion cache file.
 	champs = json.loads(open("cache/champions.json").read())["data"]
-	cache.set("champion", {champ["id"]: Champion(champ) for champ in champs.values()})
+	for champ in champs.values():
+		cache.set("champ-" + str(champ["id"]), Champion(champ))
 
 """
 ===============================
