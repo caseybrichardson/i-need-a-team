@@ -45,30 +45,30 @@ Database Tools
 """
 
 def get_db():
-  db = getattr(g, '_database', None)
-  if db is None:
-    db = g._database = sqlite3.connect(database_url)
-    db.row_factory = sqlite3.Row
-  return db
+	db = getattr(g, '_database', None)
+	if db is None:
+		db = g._database = sqlite3.connect(database_url)
+		db.row_factory = sqlite3.Row
+	return db
 
 def query_db(query, args=(), one=False):
-  cur = get_db().execute(query, args)
-  rv = cur.fetchall()
-  cur.close()
-  return (rv[0] if rv else None) if one else rv
+	cur = get_db().execute(query, args)
+	rv = cur.fetchall()
+	cur.close()
+	return (rv[0] if rv else None) if one else rv
 
 def init_db():
-  with app.app_context():
-    db = get_db()
-    with app.open_resource('schema.sql', mode='r') as f:
-      db.cursor().executescript(f.read())
-    db.commit()
+	with app.app_context():
+		db = get_db()
+		with app.open_resource('schema.sql', mode='r') as f:
+			db.cursor().executescript(f.read())
+		db.commit()
 
 @app.teardown_appcontext
 def close_connection(exception):
-  db = getattr(g, '_database', None)
-  if db is not None:
-    db.close()
+	db = getattr(g, '_database', None)
+	if db is not None:
+		db.close()
 
 """
 ===============================
@@ -128,6 +128,12 @@ def summoner_by_name(summoner_names, region="NA"):
 		summonerNames=summoner_names
 	)
 
+def summoners_by_id(summoner_ids, region="NA"):
+	return "//api/lol/{region}/v1.4/summoner/{summonerIds}".format(
+		region=region,
+		summonerIds=summoner_ids
+	)
+
 def current_game(summoner_id, platform_id="NA1"):
 	return "/observer-mode/rest/consumer/getSpectatorGameInfo/{platformId}/{summonerId}".format(
 		platformId=platform_id,
@@ -160,7 +166,15 @@ def normalize_name(name):
 	return name.replace(" ", "").lower().encode("utf-8")
 
 def get_request(url):
-	return requests.get(url)
+	data = requests.get(url)
+
+	if data.status_code == 429:
+		print("Just hit the rate limit. Look into this.")
+		wait_time = data.headers["Retry-After"]
+		time.sleep(wait_time + 2)
+		return get_request(url)
+	else:
+		return data
 
 def all_champions():
 	if not args.cache:
@@ -191,12 +205,31 @@ def name_to_summoner(name):
 			return cached
 
 	summoner_data_url = full_url(base_url, summoner_by_name(normalized))
-	summoner = Summoner(get_request(summoner_data_url).json()[normalized])
+	summoner_data = get_request(summoner_data_url)
+	if summoner_data.status_code == 404:
+		return None
+	summoner = Summoner(summoner_data.json()[normalized])
 
 	if should_cache:
 		cache.set(cache_key, summoner)
 
 	return summoner
+
+def ids_to_summoners(ids):
+	id_list = ",".join(map(lambda i: str(i), ids))
+	should_cache = get_arg("cache")
+
+	summoners_data_url = full_url(base_url, summoners_by_id(id_list))
+	response = get_request(summoners_data_url).json()
+	summoners = []
+	for summoner_data in response.values():
+		summoner = Summoner(summoner_data)
+		summoners.append(summoner)
+		cache_key = "summ-" + normalize_name(summoner.name)
+		if should_cache:
+			cache.set(cache_key, summoner)
+
+	return summoners
 
 def get_masteries(summoner_id):
 	"""Gets the masteries for the given summoner ID"""
@@ -206,7 +239,9 @@ def get_masteries(summoner_id):
 def get_match_list(summoner_id):
 	"""Gets the match list for the given summoner ID"""
 	match_data_url = full_url(base_url, match_list(summoner_id))
-	return map(lambda m: Match(m), get_request(match_data_url).json()["matches"])
+	data = get_request(match_data_url).json()
+	print data
+	return map(lambda m: Match(m), data["matches"])
 
 def get_match(match_id):
 	"""Gets the match data for the given match ID"""
@@ -240,8 +275,11 @@ def create_player(summoner):
 
 	if not player:
 		# If the player doesn't exist we're gonna put them in.
-		insert_sql = '''INSERT INTO player (id, summoner_name, highest_rank, best_position, create_time) VALUES (NULL, ?, ?, 'MID', ?)'''
-		cur.execute(insert_sql, (summoner.name, summoner.highest_rank, epoch_time()))
+		classification = summoner.classifications[0]
+		best_type = (classification["champions"][0]["lanes"][0]["lane"], classification["classification"])
+
+		insert_sql = '''INSERT INTO player (id, summoner_name, highest_rank, best_position, create_time) VALUES (NULL, ?, ?, ?, ?)'''
+		cur.execute(insert_sql, (summoner.name, summoner.highest_rank, best_type[0] + " " + best_type[1], epoch_time()))
 		player = cur.lastrowid
 
 	db.commit()
@@ -346,7 +384,6 @@ class Match(JSONObject):
 	def match_champion(self):
 		"""The champion that the player played in this match"""
 		if self._champion is None:
-			start = epoch_time()
 			self._champion = specific_champion(self.champion)
 		return self._champion
 
@@ -354,10 +391,14 @@ class MatchData(JSONObject):
 	"""MatchData model object for working with data from the API. Treat this as readonly."""
 	def __init__(self, json_obj):
 		super(MatchData, self).__init__(json_obj)
+		self.participants = {}
+		self.players = []
 		participants = json_obj["participants"]
 		participant_ids = json_obj["participantIdentities"]
-		self.participants = {}
 		for participant_id in participant_ids:
+			player = MatchPlayer(participant_id["player"])
+			self.players.append(player)
+
 			participant = filter(lambda p: p["participantId"] == participant_id["participantId"], participants)
 			if participant is not None:
 				participant = MatchParticipant(participant[0])
@@ -374,6 +415,13 @@ class MatchParticipant(JSONObject):
 		self.champion_id = json_obj["championId"]
 		self.team_id = json_obj["teamId"]
 		self.highest_achieved_season_tier = json_obj["highestAchievedSeasonTier"]
+
+class MatchPlayer(JSONObject):
+	"""MatchPlayer model object for working with data from the API. Treat this as readonly."""
+	def __init__(self, json_obj):
+		super(MatchPlayer, self).__init__(json_obj)
+		self.summoner_id = json_obj["summonerId"]
+		self.summoner_name = json_obj["summonerName"]
 
 class Champion(JSONObject):
 	"""Champion model object for working with data from the API. Treat this as readonly."""
@@ -576,7 +624,31 @@ Routes
 @app.route("/api/debug/<username>", methods=["POST", "GET"])
 def debug_create_player(username):
 	summoner = name_to_summoner(username)
-	return make_success(response={"value": summoner.classifications})
+	return make_success(response={"value": map(lambda p: p.summoner_name, summoner.matches[0].match_data.players)})
+
+@app.route("/api/debug/populate/<username>", methods=["POST", "GET"])
+def populate_db(username):
+	summoner = name_to_summoner(username)
+
+	if summoner is None:
+		return make_error(error={"message": "Could not find summoner."})
+
+	summoner_ids = []
+	for idx, match in enumerate(summoner.matches):
+		# We're only going to index four matches, should be around 40 players
+		# (the limit on how many summoner IDs you can pass into the endpoint)
+		# XXX: This just destroyed my rate limit... >.>
+		if idx == 3:
+			break
+
+		for player in match.match_data.players:
+			summoner_ids.append(player.summoner_id)
+
+	summoners = ids_to_summoners(summoner_ids)
+
+	map(lambda s: create_player(s), summoners)
+
+	return make_success(response={"message": "Done Populating"})
 
 @app.route("/api/joinateam/<username>", methods=["POST", "GET"])
 def join_a_team(username):
@@ -585,6 +657,9 @@ def join_a_team(username):
 
 	name = normalize_name(username)
 	summoner = name_to_summoner(name)
+
+	if summoner is None:
+		return make_error(error={"message": "Could not find summoner."})
 
 	# We're going to open up a new player request
 	player_request = create_player_request(summoner)
@@ -604,6 +679,9 @@ def make_a_team(username):
 
 	name = normalize_name(username)
 	summoner = name_to_summoner(name)
+
+	if summoner is None:
+		return make_error(error={"message": "Could not find summoner."})
 	
 	if check_summoner_searching(summoner):
 		# If the current summoner is building a team, we're going to return an error
