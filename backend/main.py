@@ -160,7 +160,6 @@ def normalize_name(name):
 	return name.replace(" ", "").lower().encode("utf-8")
 
 def get_request(url):
-	print "PERFORMING GET REQUEST: " + url
 	return requests.get(url)
 
 def all_champions():
@@ -348,9 +347,7 @@ class Match(JSONObject):
 		"""The champion that the player played in this match"""
 		if self._champion is None:
 			start = epoch_time()
-			print("GETTING MATCH CHAMPION: " + str(start))
 			self._champion = specific_champion(self.champion)
-			print("DONE GETTING MATCH CHAMPION: " + str(epoch_time() - start))
 		return self._champion
 
 class MatchData(JSONObject):
