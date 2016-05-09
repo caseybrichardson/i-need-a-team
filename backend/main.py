@@ -76,11 +76,20 @@ Defaults and Utils
 ===============================
 """
 
-if args is not None:
-	api_key = args.api_key
+def get_arg(arg, default=False):
+	"""Gets an argument safely if we were loaded from a module"""
+	if args is None or arg not in args:
+		return default
+	return vars(args)[arg]
+
+api_key = get_arg("api_key", default="")
 base_url = "https://na.api.pvp.net"
 static_base_url = "https://global.api.pvp.net"
 database_url = './database.db'
+
+def set_api_key(key):
+	global api_key
+	api_key = key
 
 # So the regions for the static endpoints barf on upper-case regions
 def champ_all(region="na"):
@@ -150,18 +159,23 @@ def full_url(base_url, path, query_params={}):
 def normalize_name(name):
 	return name.replace(" ", "").lower().encode("utf-8")
 
+def get_request(url):
+	print "PERFORMING GET REQUEST: " + url
+	return requests.get(url)
+
 def all_champions():
 	if not args.cache:
 		champs_data_url = full_url(static_base_url, champ_all(), query_params={"champData": "allytips,enemytips"})
-		champs_data = requests.get(champs_data_url).json()["data"]
+		champs_data = get_request(champs_data_url).json()["data"]
 		return map(lambda c: Champion(c), champs_data.values())
 	else:
 		return cache.get("champion").values()
 
 def specific_champion(champion_id):
-	if not args.cache:
+	should_cache = get_arg("cache")
+	if not should_cache:
 		champ_data_url = full_url(static_base_url, champ_specific(champion_id), query_params={"champData": "info,tags"})
-		champ_data = requests.get(champ_data_url).json()
+		champ_data = get_request(champ_data_url).json()
 		return Champion(champ_data)
 	else:
 		return cache.get("champion")[champion_id]
@@ -169,16 +183,18 @@ def specific_champion(champion_id):
 def name_to_summoner(name):
 	normalized = normalize_name(name)
 	cache_key = "summ-" + normalized
+	should_cache = get_arg("cache")
 
 	# Check our cache no matter what
-	cached = cache.get(cache_key)
-	if cached is not None:
-		return cached
+	if should_cache:
+		cached = cache.get(cache_key)
+		if cached is not None:
+			return cached
 
 	summoner_data_url = full_url(base_url, summoner_by_name(normalized))
-	summoner = Summoner(requests.get(summoner_data_url).json()[normalized])
+	summoner = Summoner(get_request(summoner_data_url).json()[normalized])
 
-	if args.cache:
+	if should_cache:
 		cache.set(cache_key, summoner)
 
 	return summoner
@@ -186,17 +202,110 @@ def name_to_summoner(name):
 def get_masteries(summoner_id):
 	"""Gets the masteries for the given summoner ID"""
 	mastery_data_url = full_url(base_url, mastery_player_all(summoner_id))
-	return map(lambda m: Mastery(m), requests.get(mastery_data_url).json())
+	return map(lambda m: Mastery(m), get_request(mastery_data_url).json())
 
 def get_match_list(summoner_id):
 	"""Gets the match list for the given summoner ID"""
 	match_data_url = full_url(base_url, match_list(summoner_id))
-	return map(lambda m: Match(m), requests.get(match_data_url).json()["matches"])
+	return map(lambda m: Match(m), get_request(match_data_url).json()["matches"])
 
 def get_match(match_id):
 	"""Gets the match data for the given match ID"""
 	match_data_url = full_url(base_url, match_specific(match_id))
-	return MatchData(requests.get(match_data_url).json())
+	return MatchData(get_request(match_data_url).json())
+
+def epoch_time():
+	"""Gets the current epoch time"""
+	return int(time.time())
+
+def check_for_player(summoner):
+	"""Checks if a player exists for the summoner"""
+	db = get_db()
+	cur = db.cursor()
+
+	# Going to check if the player exists already.
+	player = query_db('''SELECT id FROM player WHERE summoner_name = ?''', [summoner.name], one=True)
+
+	if player is None:
+		return False
+	else:
+		return player["id"]
+
+def create_player(summoner):
+	"""Creates a player if necessary"""
+	db = get_db()
+	cur = db.cursor()
+
+	# Going to check if the player exists already.
+	player = check_for_player(summoner)
+
+	if not player:
+		# If the player doesn't exist we're gonna put them in.
+		insert_sql = '''INSERT INTO player (id, summoner_name, highest_rank, best_position, create_time) VALUES (NULL, ?, ?, 'MID', ?)'''
+		cur.execute(insert_sql, (summoner.name, summoner.highest_rank, epoch_time()))
+		player = cur.lastrowid
+
+	db.commit()
+	return player
+
+def create_player_request(summoner):
+	"""Creates a new team request for a player"""
+	db = get_db()
+	cur = db.cursor()
+
+	player = create_player(summoner)
+
+	# Check if they have any open reqs out.
+	player_req = query_db('''SELECT id FROM player_req WHERE player_id = ? AND finish_time IS NULL''', [player], one=True)
+
+	if player_req is None:
+		# If they don't have any open reqs then we can create one.
+		insert_sql = '''INSERT INTO player_req (player_id, create_time) VALUES (?, ?)'''
+		cur.execute(insert_sql, (player, epoch_time()))
+		player_req = cur.lastrowid
+	else:
+		player_req = player_req["id"]
+
+	db.commit()
+	return player_req
+
+def create_team(summoner):
+	"""Creates a new team with the summoner as its leader"""
+	db = get_db()
+	cur = db.cursor()
+
+	# This will only create a player if they don't already exist
+	player = create_player(summoner)
+
+	insert_sql = '''INSERT INTO team (create_time) VALUES (?)'''
+	cur.execute(insert_sql, (epoch_time(),))
+	team_id = cur.lastrowid
+
+	insert_sql = '''INSERT INTO players_teams (player_id, team_id, leader) VALUES (?, ?, 1)'''
+	cur.execute(insert_sql, (player, team_id))
+
+	db.commit()
+	return team_id
+
+def check_summoner_searching(summoner):
+	"""Checks to see if the given summoner is currently searching for a team"""
+	db = get_db()
+	cur = db.cursor()
+
+	player = check_for_player(summoner)
+
+	if not player:
+		return False
+	else:
+		teams = query_db('''SELECT team_id FROM players_teams WHERE player_id = ? AND leader = 1''', [player])
+
+		# Scan through all the teams they've ever lead and see if any are still active
+		for team in teams:
+			team_active = query_db('''SELECT id FROM team WHERE id = ? AND finish_time IS NULL''', [team["team_id"]], one=True)
+			if team_active is not None:
+				return True
+
+	return False
 
 """
 ===============================
@@ -355,6 +464,8 @@ class Summoner(JSONObject):
 			# play their champions. This will help us make
 			# the final decision as to where they should be
 			# placed in their team.
+			start = epoch_time()
+			print("Starting champ mapping at: " + str(start))
 			champion_mapping = {}
 			champion_lane_mapping = map(lambda m: (m.match_champion.name, m.lane), self.matches)
 			for lane_mapping in champion_lane_mapping:
@@ -368,9 +479,12 @@ class Summoner(JSONObject):
 					champion_mapping[champ][lane] = 0
 
 				champion_mapping[champ][lane] += 1
+			print("Done champ mapping in: " + str(epoch_time() - start))
 
 			# Make it easier to get everything together.
 			# Don't worry we make it awful right after this.
+			start = epoch_time()
+			print("Building bins at: " + str(start))
 			bins = {}
 			for mastery in self.masteries:
 				for bin_type in mastery.champion.tags:
@@ -391,8 +505,11 @@ class Summoner(JSONObject):
 						})
 					bins[bin_type]["score"] += mastery.champion_points
 					bins[bin_type]["overall_level"] += mastery.champion_level
+			print("Done building bins in: " + str(epoch_time() - start))
 
 			# Going to rejam everything in here. I blame myself.
+			start = epoch_time()
+			print("Sorting all the crap at: " + str(start))
 			classifications = []
 			for b_type, data in bins.iteritems():
 				# Maintain order on each champion
@@ -403,6 +520,7 @@ class Summoner(JSONObject):
 
 			# We also want to maintain order on each type
 			classifications.sort(key=lambda c: c["score"], reverse=True)
+			print("Done sorting all that crap at: " + str(epoch_time() - start))
 
 			self._classifications = classifications
 		return self._classifications
@@ -453,69 +571,45 @@ Routes
 ===============================
 """
 
+@app.route("/api/debug/<username>", methods=["POST", "GET"])
+def debug_create_player(username):
+	summoner = name_to_summoner(username)
+	return make_success(response={"value": summoner.classifications})
+
 @app.route("/api/joinateam/<username>", methods=["POST", "GET"])
 def join_a_team(username):
-	# Not a fan of this
-	global store
-	global cache
 	db = get_db()
 	cur = db.cursor()
 
 	name = normalize_name(username)
 	summoner = name_to_summoner(name)
 
-	player = query_db('SELECT * FROM player WHERE summoner_name = ?', [name], one=True)
+	# We're going to open up a new player request
+	player_request = create_player_request(summoner)
 
-	if player is None:
-		cur.execute('''INSERT INTO player (id, summoner_name, highest_rank) VALUES (NULL, ?, ?)''', (name, summoner.highest_rank))
-		player_id = cur.lastrowid
-		db.commit()
+	# Then we're gonna see if we can close this req as fast as possible
+	# Quick check to see how many teams there are that are still open
+	teams = query_db('''SELECT * FROM team WHERE finish_time IS NULL''')
+	if len(teams) == 0:
+		return make_success(response={"message": "No teams just yet, but you're on the list!"})
 	else:
-		pass
+		# There may be a compatible team available so start closer examination
+		return make_success(response="WE FOUND YOU A TEAM!")
 
-	return make_success(response="You're on the list!")
 
 @app.route("/api/makeateam/<username>", methods=["POST", "GET"])
 def make_a_team(username):
-	# Not a fan of this
-	global store
-	global cache
-	db = get_db()
-	cur = db.cursor()
 
 	name = normalize_name(username)
 	summoner = name_to_summoner(name)
+	
+	if check_summoner_searching(summoner):
+		# If the current summoner is building a team, we're going to return an error
+		return make_error(error={"message": "You're already building a team!"}, response_code=200)
 
-	# Check if this player is on a team already
-	player = query_db('SELECT * FROM player WHERE summoner_name = ?', [name], one=True)
-
-	if player is None:
-		# They were not so create a player and then add them to a team as the leader
-		cur.execute('''INSERT INTO player (id, summoner_name, highest_rank) VALUES (NULL, ?, ?)''', (name, summoner.highest_rank))
-		player_id = cur.lastrowid
-		cur.execute('''INSERT INTO team (id, create_time) VALUES (NULL, ?)''', (int(time.time()),))
-		team_id = cur.lastrowid
-		cur.execute('''INSERT INTO players_teams VALUES (?, ?, 1)''', (player_id, team_id))
-		db.commit()
-		return make_success(response={"leader": name})
-	else:
-		teams = query_db('SELECT * FROM players_teams WHERE player_id = ? AND leader = 1', [player["id"]])
-
-		# Scan through all the teams they've ever lead and see if any are still active
-		for team in teams:
-			team_active = query_db('SELECT count(*) FROM players_teams WHERE team_id = ?', [team[1]], one=True)
-			if team_active is not None:
-				if team_active != 5:
-					return make_error(error={"message": "Sorry! You're already in an active search for a team!"}, response_code=200)
-
-		# If they're not actively leading a team, create a new one and put them as the leader
-		cur.execute('''INSERT OR IGNORE INTO player (id, summoner_name, highest_rank) VALUES (NULL, ?, ?)''', (name, summoner.highest_rank))
-		player_id = cur.lastrowid
-		cur.execute('''INSERT INTO team (id, create_time) VALUES (NULL, ?)''', (int(time.time()),))
-		team_id = cur.lastrowid
-		cur.execute('''INSERT INTO players_teams VALUES (?, ?, 1)''', (player_id, team_id))
-		db.commit()
-		return make_success(response={"leader": name})
+	# If they're not actively leading a team, create a new one and insert them as the leader
+	create_team(summoner)
+	return make_success(response={"leader": summoner.name})
 
 """
 ===============================
