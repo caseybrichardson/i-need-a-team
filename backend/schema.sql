@@ -26,6 +26,7 @@ CREATE TABLE players_teams(
 CREATE TABLE player_req(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   player_id INTEGER NOT NULL,
+  team_id INTEGER,
   create_time INTEGER NOT NULL,
   finish_time INTEGER
 );

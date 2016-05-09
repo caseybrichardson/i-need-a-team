@@ -240,7 +240,6 @@ def get_match_list(summoner_id):
 	"""Gets the match list for the given summoner ID"""
 	match_data_url = full_url(base_url, match_list(summoner_id))
 	data = get_request(match_data_url).json()
-	print data
 	return map(lambda m: Match(m), data["matches"])
 
 def get_match(match_id):
@@ -265,7 +264,7 @@ def check_for_player(summoner):
 	else:
 		return player["id"]
 
-def create_player(summoner):
+def create_or_get_player(summoner):
 	"""Creates a player if necessary"""
 	db = get_db()
 	cur = db.cursor()
@@ -290,7 +289,7 @@ def create_player_request(summoner):
 	db = get_db()
 	cur = db.cursor()
 
-	player = create_player(summoner)
+	player = create_or_get_player(summoner)
 
 	# Check if they have any open reqs out.
 	player_req = query_db('''SELECT id FROM player_req WHERE player_id = ? AND finish_time IS NULL''', [player], one=True)
@@ -312,7 +311,7 @@ def create_team(summoner):
 	cur = db.cursor()
 
 	# This will only create a player if they don't already exist
-	player = create_player(summoner)
+	player = create_or_get_player(summoner)
 
 	insert_sql = '''INSERT INTO team (create_time) VALUES (?)'''
 	cur.execute(insert_sql, (epoch_time(),))
@@ -320,6 +319,29 @@ def create_team(summoner):
 
 	insert_sql = '''INSERT INTO players_teams (player_id, team_id, leader) VALUES (?, ?, 1)'''
 	cur.execute(insert_sql, (player, team_id))
+
+	db.commit()
+	return team_id
+
+def join_team(player_id, player_req_id, team_id):
+	"""Sets up a player to join a team"""
+	db = get_db()
+	cur = db.cursor()
+
+	insert_sql = '''INSERT INTO players_teams (player_id, team_id) VALUES (?, ?)'''
+	cur.execute(insert_sql, (player_id, team_id))
+	team_id = cur.lastrowid
+
+	update_sql = '''UPDATE player_req SET finish_time = ? WHERE id = ?'''
+	cur.execute(update_sql, (epoch_time(), player_req_id))
+
+	query_sql = '''SELECT count(*) FROM players_teams WHERE team_id = ?'''
+	count = query_db(query_sql, [team_id], one=True)
+	print team_id
+	print count
+	if count >= 5:
+		update_sql = '''UPDATE team SET finish_time = ? WHERE id = ?'''
+		cur.execute(update_sql, (epoch_time(), team_id))
 
 	db.commit()
 	return team_id
@@ -624,7 +646,7 @@ Routes
 @app.route("/api/debug/<username>", methods=["POST", "GET"])
 def debug_create_player(username):
 	summoner = name_to_summoner(username)
-	return make_success(response={"value": map(lambda p: p.summoner_name, summoner.matches[0].match_data.players)})
+	return make_success(response={"value": summoner.classifications})
 
 @app.route("/api/debug/populate/<username>", methods=["POST", "GET"])
 def populate_db(username):
@@ -663,14 +685,38 @@ def join_a_team(username):
 
 	# We're going to open up a new player request
 	player_request = create_player_request(summoner)
+	player = query_db('''SELECT p.* FROM player p JOIN player_req pr ON pr.player_id = p.id WHERE pr.id = ?''', [player_request], one=True)
 
 	# Then we're gonna see if we can close this req as fast as possible
 	# Quick check to see how many teams there are that are still open
-	teams = query_db('''SELECT * FROM team WHERE finish_time IS NULL''')
+	teams = query_db('''SELECT t.* FROM team t JOIN players_teams pt ON pt.team_id = t.id JOIN player p ON p.id = pt.player_id WHERE finish_time IS NULL AND pt.leader = 1 AND p.highest_rank = ?''', [player["highest_rank"]])
 	if len(teams) == 0:
 		return make_success(response={"message": "No teams just yet, but you're on the list!"})
 	else:
 		# There may be a compatible team available so start closer examination
+		for row in teams:
+			query_sql = '''SELECT p.best_position AS best FROM player p JOIN players_teams pt ON pt.player_id = p.id WHERE pt.team_id = ?'''
+			current_positions_filled = query_db(query_sql, [row["id"]])
+			collision = False
+
+			# Scan for collisions
+			for position_row in current_positions_filled:
+				player_data = player["best_position"].split()
+				player_lane = player_data[0]
+				player_position = player_data[1]
+				other_data = position_row["best"].split()
+				other_lane = other_data[0]
+				other_position = other_data[1]
+				if player_lane == other_lane and player_position == other_position:
+					if player_lane != "BOTTOM":
+						collision = True
+
+			# If we don't have one then we can put them on this team
+			if not collision:
+				join_team(player["id"], player_request, row["id"])
+			else:
+				return make_success(response="No teams just yet, but you're on the list!")
+
 		return make_success(response="WE FOUND YOU A TEAM!")
 
 
